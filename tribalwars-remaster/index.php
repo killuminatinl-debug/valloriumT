@@ -29,6 +29,28 @@ function finish_queue(PDO $pdo, int $villageId): void {
         $del = $pdo->prepare('DELETE FROM build_queue WHERE id=?'); $del->execute(array($item['id']));
     }
 }
+function finish_troop_queue(PDO $pdo, int $villageId): void {
+    $s=$pdo->prepare('SELECT * FROM troop_queue WHERE village_id=? AND completes_at<=? ORDER BY completes_at ASC');
+    $s->execute(array($villageId,time()));
+    foreach($s->fetchAll() as $item) {
+        $up=$pdo->prepare('INSERT INTO village_troops(village_id,unit_key,amount) VALUES(?,?,?) ON DUPLICATE KEY UPDATE amount=amount+VALUES(amount)');
+        $up->execute(array($villageId,$item['unit_key'],$item['amount']));
+        $del=$pdo->prepare('DELETE FROM troop_queue WHERE id=?'); $del->execute(array($item['id']));
+    }
+}
+function finish_scout_marches(PDO $pdo, int $userId, int $villageId): void {
+    $s=$pdo->prepare("SELECT * FROM movements WHERE source_village_id=? AND status='traveling' AND arrives_at<=?");
+    $s->execute(array($villageId,time()));
+    foreach($s->fetchAll() as $m) {
+        $units=json_decode($m['units_json'],true) ?: array();
+        $text='Je verkenners hebben coördinaten ('.$m['target_x'].'|'.$m['target_y'].') bereikt. Eenheden: '.json_encode($units,JSON_UNESCAPED_UNICODE).'. Er is nog geen vijandelijk dorp op deze coördinaat geregistreerd.';
+        $r=$pdo->prepare('INSERT INTO game_reports(user_id,title,body) VALUES(?,?,?)');
+        $r->execute(array($userId,'Verkenningsrapport ('.$m['target_x'].'|'.$m['target_y'].')',$text));
+        $u=$pdo->prepare("UPDATE movements SET status='returned' WHERE id=?"); $u->execute(array($m['id']));
+        $back=$pdo->prepare('INSERT INTO village_troops(village_id,unit_key,amount) VALUES(?,?,?) ON DUPLICATE KEY UPDATE amount=amount+VALUES(amount)');
+        foreach($units as $key=>$amount) $back->execute(array($villageId,$key,(int)$amount));
+    }
+}
 function building_levels(PDO $pdo, int $villageId): array {
     $stmt=$pdo->prepare('SELECT building_key,level FROM buildings WHERE village_id=?'); $stmt->execute(array($villageId)); $levels=array();
     foreach($stmt->fetchAll() as $row) $levels[$row['building_key']]=(int)$row['level'];
@@ -166,10 +188,10 @@ if (!$user) {
 ?><!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tribal Wars Remaster</title><link rel="stylesheet" href="style.css"></head><body class="auth"><main class="authbox"><div class="crest">⚔</div><p class="eyebrow">EEN RIJK WORDT GESMEED</p><h1>TRIBAL WARS <span>REMASTER</span></h1><p class="muted">Bouw je dorp. Verzamel grondstoffen. Bereid je voor op oorlog.</p><?php if($error!==''): ?><p class="notice"><?=h($error)?></p><?php endif; ?><form method="post"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><label>Gebruikersnaam of e-mail</label><input name="username" required autocomplete="username"><label>E-mail (alleen nodig bij registreren)</label><input name="email" type="email" autocomplete="email"><label>Wachtwoord</label><input name="password" type="password" required autocomplete="current-password"><div class="authbuttons"><button name="auth_action" value="login">Inloggen</button><button name="auth_action" value="register" class="secondary">Account maken</button></div></form><small>Eigen fan-game prototype; geen officiële Tribal Wars-productie.</small></main></body></html><?php exit; }
 $s=$pdo->prepare('SELECT * FROM villages WHERE user_id=?'); $s->execute(array($user['id'])); $v=$s->fetch();
 if (!$v) { $ins=$pdo->prepare('INSERT INTO villages(user_id,name) VALUES(?,?)'); $ins->execute(array($user['id'],'Thuisdorp')); header('Location: ./'); exit; }
-finish_queue($pdo,(int)$v['id']); $s->execute(array($user['id'])); $v=$s->fetch();
-$tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execute(array($now,$v['id'])); $levels=building_levels($pdo,(int)$v['id']); $q=$pdo->prepare('SELECT * FROM build_queue WHERE village_id=? ORDER BY completes_at'); $q->execute(array($v['id'])); $queue=$q->fetchAll();
+finish_queue($pdo,(int)$v['id']); finish_troop_queue($pdo,(int)$v['id']); finish_scout_marches($pdo,(int)$user['id'],(int)$v['id']); $s->execute(array($user['id'])); $v=$s->fetch();
+$now=time(); $levels=building_levels($pdo,(int)$v['id']); $q=$pdo->prepare('SELECT * FROM build_queue WHERE village_id=? ORDER BY completes_at'); $q->execute(array($v['id'])); $queue=$q->fetchAll();
 $rate=array('wood'=>30+($levels['wood']??0)*18,'clay'=>30+($levels['clay']??0)*18,'iron'=>20+($levels['iron']??0)*16,'crop'=>35+($levels['farm']??0)*22);
-$now=time(); $cap=1000+($levels['storage']??1)*1000;
+$cap=1000+($levels['storage']??1)*1000;
 foreach(array('wood','clay','iron','crop') as $r) { $elapsed=max(0,$now-(int)$v['last_tick']); $amount=min($cap,(int)$v[$r]+(int)floor($rate[$r]*$elapsed/3600)); if($amount!==(int)$v[$r]) { $u=$pdo->prepare('UPDATE villages SET '.$r.'=? WHERE id=?'); $u->execute(array($amount,$v['id'])); $v[$r]=$amount; } }
 $tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execute(array($now,$v['id']));
 $levels=building_levels($pdo,(int)$v['id']); $q->execute(array($v['id'])); $queue=$q->fetchAll();
