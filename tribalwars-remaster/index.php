@@ -95,7 +95,7 @@ if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['auth_action'])) {
             else {
                 try {
                     $pdo->beginTransaction(); $ins=$pdo->prepare('INSERT INTO users(username,email,password_hash) VALUES(?,?,?)'); $ins->execute(array($name,$email,password_hash($pass,PASSWORD_DEFAULT))); $uid=(int)$pdo->lastInsertId();
-                    $v=$pdo->prepare('INSERT INTO villages(user_id,name,x,y) VALUES(?,?,?,?)'); $v->execute(array($uid,'Thuisdorp',random_int(470,530),random_int(470,530))); $vid=(int)$pdo->lastInsertId();
+                    $v=$pdo->prepare('INSERT INTO villages(user_id,name,x,y,last_tick) VALUES(?,?,?,?,?)'); $v->execute(array($uid,'Thuisdorp',random_int(470,530),random_int(470,530),time())); $vid=(int)$pdo->lastInsertId();
                     $bi=$pdo->prepare('INSERT INTO buildings(village_id,building_key,level) VALUES(?,?,?)');
                     foreach(array('main'=>1,'wood'=>1,'clay'=>1,'iron'=>1,'farm'=>1,'storage'=>1,'barracks'=>0) as $key=>$level) $bi->execute(array($vid,$key,$level));
                     $pdo->commit(); session_regenerate_id(true); $_SESSION['user_id']=$uid; header('Location: ./'); exit;
@@ -115,10 +115,10 @@ if (!$user) {
 $s=$pdo->prepare('SELECT * FROM villages WHERE user_id=?'); $s->execute(array($user['id'])); $v=$s->fetch();
 if (!$v) { $ins=$pdo->prepare('INSERT INTO villages(user_id,name) VALUES(?,?)'); $ins->execute(array($user['id'],'Thuisdorp')); header('Location: ./'); exit; }
 finish_queue($pdo,(int)$v['id']); $s->execute(array($user['id'])); $v=$s->fetch();
-$levels=building_levels($pdo,(int)$v['id']); $q=$pdo->prepare('SELECT * FROM build_queue WHERE village_id=? ORDER BY completes_at'); $q->execute(array($v['id'])); $queue=$q->fetchAll();
+$tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execute(array($now,$v['id'])); $levels=building_levels($pdo,(int)$v['id']); $q=$pdo->prepare('SELECT * FROM build_queue WHERE village_id=? ORDER BY completes_at'); $q->execute(array($v['id'])); $queue=$q->fetchAll();
 $rate=array('wood'=>30+($levels['wood']??0)*18,'clay'=>30+($levels['clay']??0)*18,'iron'=>20+($levels['iron']??0)*16,'crop'=>35+($levels['farm']??0)*22);
 $now=time(); $cap=1000+($levels['storage']??1)*1000;
-foreach(array('wood','clay','iron','crop') as $r) { $elapsed=max(0,$now-strtotime((string)$v['created_at'])); $amount=min($cap,(int)$v[$r]+(int)floor($rate[$r]*$elapsed/3600)); if($amount!==(int)$v[$r]) { $u=$pdo->prepare('UPDATE villages SET '.$r.'=? WHERE id=?'); $u->execute(array($amount,$v['id'])); $v[$r]=$amount; } }
+foreach(array('wood','clay','iron','crop') as $r) { $elapsed=max(0,$now-(int)$v['last_tick']); $amount=min($cap,(int)$v[$r]+(int)floor($rate[$r]*$elapsed/3600)); if($amount!==(int)$v[$r]) { $u=$pdo->prepare('UPDATE villages SET '.$r.'=? WHERE id=?'); $u->execute(array($amount,$v['id'])); $v[$r]=$amount; } }
 $levels=building_levels($pdo,(int)$v['id']); $q->execute(array($v['id'])); $queue=$q->fetchAll();
 ?><!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h($v['name'])?> — Tribal Wars Remaster</title><link rel="stylesheet" href="style.css"></head><body>
 <header class="topbar"><a class="brand" href="./"><span>⚔</span> TRIBAL WARS <b>REMASTER</b></a><div class="resources"><?php foreach(array('wood'=>'🪵','clay'=>'🧱','iron'=>'⛓','crop'=>'🌾') as $r=>$icon): ?><div class="resource"><span><?=$icon?></span><strong><?=number_format((int)$v[$r])?></strong><small>+<?=$rate[$r]?>/u</small></div><?php endforeach; ?></div><div class="usernav">👤 <?=h($user['username'])?> <a href="?logout=1">Uitloggen</a></div></header>
