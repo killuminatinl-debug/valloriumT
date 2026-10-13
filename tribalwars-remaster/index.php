@@ -119,6 +119,7 @@ $tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execut
 $rate=array('wood'=>30+($levels['wood']??0)*18,'clay'=>30+($levels['clay']??0)*18,'iron'=>20+($levels['iron']??0)*16,'crop'=>35+($levels['farm']??0)*22);
 $now=time(); $cap=1000+($levels['storage']??1)*1000;
 foreach(array('wood','clay','iron','crop') as $r) { $elapsed=max(0,$now-(int)$v['last_tick']); $amount=min($cap,(int)$v[$r]+(int)floor($rate[$r]*$elapsed/3600)); if($amount!==(int)$v[$r]) { $u=$pdo->prepare('UPDATE villages SET '.$r.'=? WHERE id=?'); $u->execute(array($amount,$v['id'])); $v[$r]=$amount; } }
+$tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execute(array($now,$v['id']));
 $levels=building_levels($pdo,(int)$v['id']); $q->execute(array($v['id'])); $queue=$q->fetchAll();
 ?><!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h($v['name'])?> — Tribal Wars Remaster</title><link rel="stylesheet" href="style.css"></head><body>
 <header class="topbar"><a class="brand" href="./"><span>⚔</span> TRIBAL WARS <b>REMASTER</b></a><div class="resources"><?php foreach(array('wood'=>'🪵','clay'=>'🧱','iron'=>'⛓','crop'=>'🌾') as $r=>$icon): ?><div class="resource"><span><?=$icon?></span><strong><?=number_format((int)$v[$r])?></strong><small>+<?=$rate[$r]?>/u</small></div><?php endforeach; ?></div><div class="usernav">👤 <?=h($user['username'])?> <a href="?logout=1">Uitloggen</a></div></header>
