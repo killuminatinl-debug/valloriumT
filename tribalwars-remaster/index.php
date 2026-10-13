@@ -1,0 +1,228 @@
+<?php
+declare(strict_types=1);
+session_start();
+$configFile = __DIR__.'/config.local.php';
+if (!is_file($configFile)) { header('Location: install.php'); exit; }
+$config = require $configFile;
+try {
+    $pdo = new PDO('mysql:host='.$config['host'].';port='.$config['port'].';dbname='.$config['database'].';charset=utf8mb4', $config['username'], $config['password'], array(PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC));
+} catch (Throwable $e) { http_response_code(500); exit('Databaseverbinding mislukt. Controleer config.local.php en de MySQL-service.'); }
+function h($v) { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+function csrf(): string { if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32)); return $_SESSION['csrf']; }
+function json_out(array $data, int $status=200): void { http_response_code($status); header('Content-Type: application/json; charset=utf-8'); echo json_encode($data); exit; }
+$catalog = array(
+ 'main'=>array('name'=>'Hoofdgebouw','icon'=>'🏰','base'=>100,'desc'=>'Versnelt de bouw van je dorp.'),
+ 'wood'=>array('name'=>'Houthakker','icon'=>'🪓','base'=>80,'desc'=>'Levert hout voor je rijk.'),
+ 'clay'=>array('name'=>'Leemgroeve','icon'=>'🧱','base'=>80,'desc'=>'Levert leem voor gebouwen.'),
+ 'iron'=>array('name'=>'IJzermijn','icon'=>'⛏️','base'=>80,'desc'=>'Levert ijzer voor troepen en gebouwen.'),
+ 'farm'=>array('name'=>'Boerderij','icon'=>'🌾','base'=>120,'desc'=>'Verhoogt de voedselcapaciteit.'),
+ 'storage'=>array('name'=>'Pakhuis','icon'=>'📦','base'=>100,'desc'=>'Verhoogt de opslagcapaciteit.'),
+ 'barracks'=>array('name'=>'Kazerne','icon'=>'🛡️','base'=>150,'desc'=>'Trainingsgebouw voor infanterie.')
+);
+function finish_queue(PDO $pdo, int $villageId): void {
+    $now = time();
+    $q = $pdo->prepare('SELECT * FROM build_queue WHERE village_id=? AND completes_at<=? ORDER BY completes_at ASC');
+    $q->execute(array($villageId,$now));
+    foreach ($q->fetchAll() as $item) {
+        $up = $pdo->prepare('INSERT INTO buildings(village_id,building_key,level) VALUES(?,?,?) ON DUPLICATE KEY UPDATE level=GREATEST(level,VALUES(level))');
+        $up->execute(array($villageId,$item['building_key'],$item['target_level']));
+        $del = $pdo->prepare('DELETE FROM build_queue WHERE id=?'); $del->execute(array($item['id']));
+    }
+}
+function finish_troop_queue(PDO $pdo, int $villageId): void {
+    $s=$pdo->prepare('SELECT * FROM troop_queue WHERE village_id=? AND completes_at<=? ORDER BY completes_at ASC');
+    $s->execute(array($villageId,time()));
+    foreach($s->fetchAll() as $item) {
+        $up=$pdo->prepare('INSERT INTO village_troops(village_id,unit_key,amount) VALUES(?,?,?) ON DUPLICATE KEY UPDATE amount=amount+VALUES(amount)');
+        $up->execute(array($villageId,$item['unit_key'],$item['amount']));
+        $del=$pdo->prepare('DELETE FROM troop_queue WHERE id=?'); $del->execute(array($item['id']));
+    }
+}
+function finish_scout_marches(PDO $pdo, int $userId, int $villageId): void {
+    $s=$pdo->prepare("SELECT * FROM movements WHERE source_village_id=? AND status='traveling' AND arrives_at<=?");
+    $s->execute(array($villageId,time()));
+    foreach($s->fetchAll() as $m) {
+        $units=json_decode($m['units_json'],true) ?: array();
+        $text='Je verkenners hebben coördinaten ('.$m['target_x'].'|'.$m['target_y'].') bereikt. Eenheden: '.json_encode($units,JSON_UNESCAPED_UNICODE).'. Er is nog geen vijandelijk dorp op deze coördinaat geregistreerd.';
+        $r=$pdo->prepare('INSERT INTO game_reports(user_id,title,body) VALUES(?,?,?)');
+        $r->execute(array($userId,'Verkenningsrapport ('.$m['target_x'].'|'.$m['target_y'].')',$text));
+        $u=$pdo->prepare("UPDATE movements SET status='returned' WHERE id=?"); $u->execute(array($m['id']));
+        $back=$pdo->prepare('INSERT INTO village_troops(village_id,unit_key,amount) VALUES(?,?,?) ON DUPLICATE KEY UPDATE amount=amount+VALUES(amount)');
+        foreach($units as $key=>$amount) $back->execute(array($villageId,$key,(int)$amount));
+    }
+}
+function building_levels(PDO $pdo, int $villageId): array {
+    $stmt=$pdo->prepare('SELECT building_key,level FROM buildings WHERE village_id=?'); $stmt->execute(array($villageId)); $levels=array();
+    foreach($stmt->fetchAll() as $row) $levels[$row['building_key']]=(int)$row['level'];
+    return $levels;
+}
+function building_cost(string $key, int $level): array {
+    $base=array('main'=>100,'wood'=>80,'clay'=>80,'iron'=>80,'farm'=>120,'storage'=>100,'barracks'=>150)[$key] ?? 100;
+    $mult=pow(1.26,max(0,$level-1));
+    return array('wood'=>(int)ceil($base*$mult),'clay'=>(int)ceil($base*0.85*$mult),'iron'=>(int)ceil($base*0.7*$mult),'crop'=>(int)ceil($base*0.5*$mult));
+}
+function current_user(PDO $pdo): ?array {
+    if (empty($_SESSION['user_id'])) return null;
+    $s=$pdo->prepare('SELECT id,username,email FROM users WHERE id=?'); $s->execute(array((int)$_SESSION['user_id'])); $u=$s->fetch();
+    return $u ?: null;
+}
+if (isset($_GET['api'])) {
+    $user=current_user($pdo); if (!$user) json_out(array('ok'=>false,'error'=>'Log eerst in.'),401);
+    $s=$pdo->prepare('SELECT * FROM villages WHERE user_id=?'); $s->execute(array($user['id'])); $v=$s->fetch();
+    if (!$v) json_out(array('ok'=>false,'error'=>'Geen dorp gevonden.'),404);
+    finish_queue($pdo,(int)$v['id']);
+    if ($_SERVER['REQUEST_METHOD']!=='POST') json_out(array('ok'=>false,'error'=>'POST vereist.'),405);
+    $input=json_decode((string)file_get_contents('php://input'),true) ?: array();
+    if (!hash_equals(csrf(),(string)($input['csrf'] ?? ''))) json_out(array('ok'=>false,'error'=>'Beveiligingstoken verlopen. Vernieuw de pagina.'),403);
+    $action=(string)($input['action'] ?? '');
+    if ($action==='upgrade') {
+        $key=(string)($input['building'] ?? '');
+        if (!isset($GLOBALS['catalog'][$key])) json_out(array('ok'=>false,'error'=>'Onbekend gebouw.'),400);
+        $levels=building_levels($pdo,(int)$v['id']); $level=$levels[$key] ?? 0; $target=$level+1;
+        $q=$pdo->prepare('SELECT COUNT(*) FROM build_queue WHERE village_id=?'); $q->execute(array($v['id']));
+        if ((int)$q->fetchColumn()>=2) json_out(array('ok'=>false,'error'=>'Je bouwrij is vol (maximaal 2 opdrachten).'),400);
+        $cost=building_cost($key,$target);
+        foreach($cost as $resource=>$amount) if ((int)$v[$resource]<$amount) json_out(array('ok'=>false,'error'=>'Niet genoeg grondstoffen. Nodig: '.implode(', ',array_map(function($k,$n){return $n.' '.$k;},array_keys($cost),$cost)).'.'),400);
+        $pdo->beginTransaction();
+        try {
+            $upd=$pdo->prepare('UPDATE villages SET wood=wood-?,clay=clay-?,iron=iron-?,crop=crop-? WHERE id=? AND wood>=? AND clay>=? AND iron>=? AND crop>=?');
+            $upd->execute(array($cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],$v['id'],$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop']));
+            if ($upd->rowCount()!==1) throw new RuntimeException('Grondstoffen zijn gewijzigd; probeer opnieuw.');
+            $duration=max(15,(int)(45*pow(1.55,$target-1)));
+            $ins=$pdo->prepare('INSERT INTO build_queue(village_id,building_key,target_level,wood_cost,clay_cost,iron_cost,crop_cost,started_at,completes_at) VALUES(?,?,?,?,?,?,?,?,?)');
+            $ins->execute(array($v['id'],$key,$target,$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],time(),time()+$duration));
+            $pdo->commit();
+        } catch(Throwable $e) { $pdo->rollBack(); json_out(array('ok'=>false,'error'=>$e->getMessage()),400); }
+        json_out(array('ok'=>true,'message'=>$catalog[$key]['name'].' niveau '.$target.' wordt gebouwd.','refresh'=>true));
+    }
+    if ($action==='cancel') {
+        $id=(int)($input['id'] ?? 0);
+        $pdo->beginTransaction();
+        $qs=$pdo->prepare('SELECT * FROM build_queue WHERE id=? AND village_id=? FOR UPDATE'); $qs->execute(array($id,$v['id'])); $item=$qs->fetch();
+        if (!$item) { $pdo->rollBack(); json_out(array('ok'=>false,'error'=>'Bouwopdracht niet gevonden.'),404); }
+        $refund=$pdo->prepare('UPDATE villages SET wood=wood+?,clay=clay+?,iron=iron+?,crop=crop+? WHERE id=?');
+        $refund->execute(array((int)floor($item['wood_cost']*.5),(int)floor($item['clay_cost']*.5),(int)floor($item['iron_cost']*.5),(int)floor($item['crop_cost']*.5),$v['id']));
+        $del=$pdo->prepare('DELETE FROM build_queue WHERE id=?'); $del->execute(array($id)); $pdo->commit();
+        json_out(array('ok'=>true,'message'=>'Bouw geannuleerd; 50% van de kosten terugbetaald.','refresh'=>true));
+    }
+    if ($action==='recruit') {
+        $unit=(string)($input['unit']??'spear'); $amount=(int)($input['amount']??0);
+        $units=array('spear'=>array('name'=>'Speervechter','wood'=>50,'clay'=>30,'iron'=>10,'crop'=>15,'seconds'=>20),'sword'=>array('name'=>'Zwaardvechter','wood'=>30,'clay'=>30,'iron'=>70,'crop'=>15,'seconds'=>28),'axe'=>array('name'=>'Bijlvechter','wood'=>60,'clay'=>30,'iron'=>40,'crop'=>20,'seconds'=>25),'scout'=>array('name'=>'Verkenner','wood'=>50,'clay'=>50,'iron'=>20,'crop'=>10,'seconds'=>18));
+        if(!isset($units[$unit])||$amount<1||$amount>100) json_out(array('ok'=>false,'error'=>'Kies een geldige eenheid en 1–100 troepen.'),400);
+        $u=$units[$unit]; $cost=array('wood'=>$u['wood']*$amount,'clay'=>$u['clay']*$amount,'iron'=>$u['iron']*$amount,'crop'=>$u['crop']*$amount);
+        foreach($cost as $r=>$n) if((int)$v[$r]<$n) json_out(array('ok'=>false,'error'=>'Niet genoeg grondstoffen om deze troepen te trainen.'),400);
+        $b=$pdo->prepare('SELECT level FROM buildings WHERE village_id=? AND building_key=?'); $b->execute(array($v['id'],'barracks'));
+        if((int)$b->fetchColumn()<1) json_out(array('ok'=>false,'error'=>'Bouw eerst de kazerne.'),400);
+        $pdo->beginTransaction();
+        try {
+            $up=$pdo->prepare('UPDATE villages SET wood=wood-?,clay=clay-?,iron=iron-?,crop=crop-? WHERE id=? AND wood>=? AND clay>=? AND iron>=? AND crop>=?');
+            $up->execute(array($cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],$v['id'],$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop']));
+            if($up->rowCount()!==1) throw new RuntimeException('Grondstoffen gewijzigd; probeer opnieuw.');
+            $ins=$pdo->prepare('INSERT INTO troop_queue(village_id,unit_key,amount,wood_cost,clay_cost,iron_cost,crop_cost,completes_at) VALUES(?,?,?,?,?,?,?,?)');
+            $ins->execute(array($v['id'],$unit,$amount,$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],time()+max(20,$u['seconds']*$amount)));
+            $pdo->commit();
+        } catch(Throwable $e) { $pdo->rollBack(); json_out(array('ok'=>false,'error'=>$e->getMessage()),400); }
+        json_out(array('ok'=>true,'message'=>$amount.' '.$u['name'].' in de trainingsrij gezet.','refresh'=>true));
+    }
+    if ($action==='send_troops') {
+        $x=filter_var($input['x']??null,FILTER_VALIDATE_INT); $y=filter_var($input['y']??null,FILTER_VALIDATE_INT);
+        $unit=(string)($input['unit']??'spear'); $amount=(int)($input['amount']??0);
+        if($x===false||$y===false||$x<0||$x>999||$y<0||$y>999||$amount<1||$amount>10000||!in_array($unit,array('spear','sword','axe','scout'),true)) json_out(array('ok'=>false,'error'=>'Controleer coördinaten, eenheid en aantal.'),400);
+        $s=$pdo->prepare('SELECT amount FROM village_troops WHERE village_id=? AND unit_key=?'); $s->execute(array($v['id'],$unit)); $owned=(int)$s->fetchColumn();
+        if($owned<$amount) json_out(array('ok'=>false,'error'=>'Je hebt niet genoeg beschikbare troepen van dit type.'),400);
+        $distance=sqrt(pow($x-(int)$v['x'],2)+pow($y-(int)$v['y'],2)); $seconds=max(30,(int)ceil($distance*60));
+        $pdo->beginTransaction();
+        $upd=$pdo->prepare('UPDATE village_troops SET amount=amount-? WHERE village_id=? AND unit_key=? AND amount>=?'); $upd->execute(array($amount,$v['id'],$unit,$amount));
+        if($upd->rowCount()!==1){$pdo->rollBack();json_out(array('ok'=>false,'error'=>'Troepenvoorraad is gewijzigd.'),400);}
+        $mv=$pdo->prepare('INSERT INTO movements(source_village_id,target_x,target_y,units_json,movement_type,status,started_at,arrives_at) VALUES(?,?,?,?,?,?,?,?)');
+        $mv->execute(array($v['id'],$x,$y,json_encode(array($unit=>$amount)),'scout','traveling',time(),time()+$seconds));
+        $pdo->commit();
+        json_out(array('ok'=>true,'message'=>'Verkenningsmars gestart. Aankomst over ongeveer '.$seconds.' seconden.','refresh'=>true));
+    }
+    if ($action==='create_tribe') {
+        $name=trim((string)($input['name']??'')); $tag=strtoupper(trim((string)($input['tag']??'')));
+        if(mb_strlen($name)<3||mb_strlen($name)>40||!preg_match('/^[A-Z0-9]{2,8}$/',$tag)) json_out(array('ok'=>false,'error'=>'Stamnaam: 3–40 tekens; tag: 2–8 letters/cijfers.'),400);
+        $check=$pdo->prepare('SELECT tribe_id FROM tribe_members WHERE user_id=?'); $check->execute(array($user['id']));
+        if($check->fetchColumn()) json_out(array('ok'=>false,'error'=>'Je zit al in een stam.'),400);
+        try { $pdo->beginTransaction(); $ins=$pdo->prepare('INSERT INTO tribes(name,tag,founder_id,description) VALUES(?,?,?,?)'); $ins->execute(array($name,$tag,$user['id'],'Een nieuwe stam.')); $tid=(int)$pdo->lastInsertId(); $mem=$pdo->prepare('INSERT INTO tribe_members(tribe_id,user_id,role) VALUES(?,?,?)'); $mem->execute(array($tid,$user['id'],'founder')); $pdo->commit(); }
+        catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();json_out(array('ok'=>false,'error'=>'Deze stamnaam of tag is al bezet.'),400);}
+        json_out(array('ok'=>true,'message'=>'Stam '.$tag.' is opgericht.','refresh'=>true));
+    }
+    if ($action==='send_message') {
+        $to=trim((string)($input['to']??'')); $subject=trim((string)($input['subject']??'')); $body=trim((string)($input['body']??''));
+        if($to===''||$subject===''||$body===''||mb_strlen($subject)>150||mb_strlen($body)>4000) json_out(array('ok'=>false,'error'=>'Vul ontvanger, onderwerp en bericht in (max. 4000 tekens).'),400);
+        $find=$pdo->prepare('SELECT id FROM users WHERE username=?'); $find->execute(array($to)); $recipient=(int)$find->fetchColumn();
+        if(!$recipient) json_out(array('ok'=>false,'error'=>'Ontvanger niet gevonden.'),404);
+        $ins=$pdo->prepare('INSERT INTO game_messages(sender_id,recipient_id,subject,body) VALUES(?,?,?,?)'); $ins->execute(array($user['id'],$recipient,$subject,$body));
+        $rep=$pdo->prepare('INSERT INTO game_reports(user_id,title,body) VALUES(?,?,?)'); $rep->execute(array($user['id'],'Bericht verzonden: '.$subject,'Je bericht aan '.$to.' is verzonden.'));
+        json_out(array('ok'=>true,'message'=>'Bericht verzonden.','refresh'=>true));
+    }
+    json_out(array('ok'=>false,'error'=>'Onbekende actie.'),400);
+}
+$error=''; $message='';
+if ($_SERVER['REQUEST_METHOD']==='POST' && isset($_POST['auth_action'])) {
+    if (!hash_equals(csrf(),(string)($_POST['csrf'] ?? ''))) $error='Beveiligingstoken verlopen. Vernieuw de pagina.';
+    else {
+        $action=(string)$_POST['auth_action']; $name=trim((string)($_POST['username'] ?? '')); $email=trim((string)($_POST['email'] ?? '')); $pass=(string)($_POST['password'] ?? '');
+        if ($action==='register') {
+            if (!preg_match('/^[a-zA-Z0-9_]{3,32}$/',$name) || !filter_var($email,FILTER_VALIDATE_EMAIL) || strlen($pass)<10) $error='Gebruik een gebruikersnaam van 3–32 tekens, geldig e-mailadres en wachtwoord van minimaal 10 tekens.';
+            else {
+                try {
+                    $pdo->beginTransaction(); $ins=$pdo->prepare('INSERT INTO users(username,email,password_hash) VALUES(?,?,?)'); $ins->execute(array($name,$email,password_hash($pass,PASSWORD_DEFAULT))); $uid=(int)$pdo->lastInsertId();
+                    $v=$pdo->prepare('INSERT INTO villages(user_id,name,x,y,last_tick) VALUES(?,?,?,?,?)'); $v->execute(array($uid,'Thuisdorp',random_int(470,530),random_int(470,530),time())); $vid=(int)$pdo->lastInsertId();
+                    $bi=$pdo->prepare('INSERT INTO buildings(village_id,building_key,level) VALUES(?,?,?)');
+                    foreach(array('main'=>1,'wood'=>1,'clay'=>1,'iron'=>1,'farm'=>1,'storage'=>1,'barracks'=>0) as $key=>$level) $bi->execute(array($vid,$key,$level));
+                    $pdo->commit(); session_regenerate_id(true); $_SESSION['user_id']=$uid; header('Location: ./'); exit;
+                } catch(Throwable $e) { if($pdo->inTransaction())$pdo->rollBack(); $error='Registratie mislukt. Gebruikersnaam of e-mailadres is mogelijk al in gebruik.'; }
+            }
+        } elseif ($action==='login') {
+            $s=$pdo->prepare('SELECT id,password_hash FROM users WHERE username=? OR email=? LIMIT 1'); $s->execute(array($name,$name)); $row=$s->fetch();
+            if ($row && password_verify($pass,$row['password_hash'])) { session_regenerate_id(true); $_SESSION['user_id']=(int)$row['id']; header('Location: ./'); exit; }
+            $error='Inloggen mislukt. Controleer je gegevens.';
+        }
+    }
+}
+if (isset($_GET['logout'])) { $_SESSION=array(); session_destroy(); header('Location: ./'); exit; }
+$user=current_user($pdo);
+if (!$user) {
+?><!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Tribal Wars Remaster</title><link rel="stylesheet" href="style.css"></head><body class="auth"><main class="authbox"><div class="crest">⚔</div><p class="eyebrow">EEN RIJK WORDT GESMEED</p><h1>TRIBAL WARS <span>REMASTER</span></h1><p class="muted">Bouw je dorp. Verzamel grondstoffen. Bereid je voor op oorlog.</p><?php if($error!==''): ?><p class="notice"><?=h($error)?></p><?php endif; ?><form method="post"><input type="hidden" name="csrf" value="<?=h(csrf())?>"><label>Gebruikersnaam of e-mail</label><input name="username" required autocomplete="username"><label>E-mail (alleen nodig bij registreren)</label><input name="email" type="email" autocomplete="email"><label>Wachtwoord</label><input name="password" type="password" required autocomplete="current-password"><div class="authbuttons"><button name="auth_action" value="login">Inloggen</button><button name="auth_action" value="register" class="secondary">Account maken</button></div></form><small>Eigen fan-game prototype; geen officiële Tribal Wars-productie.</small></main></body></html><?php exit; }
+$s=$pdo->prepare('SELECT * FROM villages WHERE user_id=?'); $s->execute(array($user['id'])); $v=$s->fetch();
+if (!$v) { $ins=$pdo->prepare('INSERT INTO villages(user_id,name) VALUES(?,?)'); $ins->execute(array($user['id'],'Thuisdorp')); header('Location: ./'); exit; }
+finish_queue($pdo,(int)$v['id']); finish_troop_queue($pdo,(int)$v['id']); finish_scout_marches($pdo,(int)$user['id'],(int)$v['id']); $s->execute(array($user['id'])); $v=$s->fetch();
+$now=time(); $levels=building_levels($pdo,(int)$v['id']); $q=$pdo->prepare('SELECT * FROM build_queue WHERE village_id=? ORDER BY completes_at'); $q->execute(array($v['id'])); $queue=$q->fetchAll();
+$rate=array('wood'=>30+($levels['wood']??0)*18,'clay'=>30+($levels['clay']??0)*18,'iron'=>20+($levels['iron']??0)*16,'crop'=>35+($levels['farm']??0)*22);
+$cap=1000+($levels['storage']??1)*1000;
+foreach(array('wood','clay','iron','crop') as $r) { $elapsed=max(0,$now-(int)$v['last_tick']); $amount=min($cap,(int)$v[$r]+(int)floor($rate[$r]*$elapsed/3600)); if($amount!==(int)$v[$r]) { $u=$pdo->prepare('UPDATE villages SET '.$r.'=? WHERE id=?'); $u->execute(array($amount,$v['id'])); $v[$r]=$amount; } }
+$tick=$pdo->prepare('UPDATE villages SET last_tick=? WHERE id=?'); $tick->execute(array($now,$v['id']));
+$levels=building_levels($pdo,(int)$v['id']); $q->execute(array($v['id'])); $queue=$q->fetchAll();
+$troopNames=array('spear'=>'Speervechter','sword'=>'Zwaardvechter','axe'=>'Bijlvechter','scout'=>'Verkenner');
+$ts=$pdo->prepare('SELECT unit_key,amount FROM village_troops WHERE village_id=?'); $ts->execute(array($v['id'])); $troops=array_fill_keys(array_keys($troopNames),0); foreach($ts->fetchAll() as $tr) $troops[$tr['unit_key']]=(int)$tr['amount'];
+$tqs=$pdo->prepare('SELECT * FROM troop_queue WHERE village_id=? ORDER BY completes_at'); $tqs->execute(array($v['id'])); $troopQueue=$tqs->fetchAll();
+$reportsStmt=$pdo->prepare('SELECT * FROM game_reports WHERE user_id=? ORDER BY created_at DESC LIMIT 8'); $reportsStmt->execute(array($user['id'])); $reports=$reportsStmt->fetchAll();
+$messagesStmt=$pdo->prepare('SELECT m.*,u.username AS sender_name FROM game_messages m JOIN users u ON u.id=m.sender_id WHERE m.recipient_id=? ORDER BY m.created_at DESC LIMIT 8'); $messagesStmt->execute(array($user['id'])); $messages=$messagesStmt->fetchAll();
+$tribeStmt=$pdo->prepare('SELECT t.*,tm.role FROM tribe_members tm JOIN tribes t ON t.id=tm.tribe_id WHERE tm.user_id=? LIMIT 1'); $tribeStmt->execute(array($user['id'])); $tribe=$tribeStmt->fetch();
+?><!doctype html><html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title><?=h($v['name'])?> — Tribal Wars Remaster</title><link rel="stylesheet" href="style.css"></head><body>
+<header class="topbar"><a class="brand" href="./"><span>⚔</span> TRIBAL WARS <b>REMASTER</b></a><div class="resources"><?php foreach(array('wood'=>'🪵','clay'=>'🧱','iron'=>'⛓','crop'=>'🌾') as $r=>$icon): ?><div class="resource"><span><?=$icon?></span><strong><?=number_format((int)$v[$r])?></strong><small>+<?=$rate[$r]?>/u</small></div><?php endforeach; ?></div><div class="usernav">👤 <?=h($user['username'])?> <a href="?logout=1">Uitloggen</a></div></header>
+<nav class="mainnav"><a class="active" href="#village">Dorp</a><a href="#buildings">Gebouwen</a><a href="#queue">Bouwrij <em><?=count($queue)?></em></a><a href="#map">Kaart</a><a href="#army">Leger</a><a href="#tribe">Stam</a><a href="#reports">Rapporten</a></nav>
+<main class="layout"><aside class="sidebar"><div class="profile"><div class="avatar">♜</div><div><b><?=h($v['name'])?></b><small>Coördinaten (<?= (int)$v['x'] ?>|<?= (int)$v['y'] ?>)</small></div></div><div class="sidehead">DORPSMENU</div><a class="sideactive" href="#village">🏰 Overzicht</a><a href="#buildings">🛠 Gebouwen</a><a href="#map">🗺 Wereldkaart</a><a href="#queue">⏳ Bouwrij</a><a href="#army">🛡 Troepen <span class="soon">binnenkort</span></a><a href="#tribe">⚑ Stam <span class="soon">binnenkort</span></a><div class="sidebarfoot">WERELD 1 <b>Speed ×1</b><small>PHP 7.4 · MySQL</small></div></aside>
+<section class="content"><div class="welcome"><div><p class="eyebrow">WERELD 1 · NOORDRIJK</p><h1><?=h($v['name'])?></h1><p>Een nieuw rijk begint met één dorp.</p></div><div class="rank"><span>RANG</span><b>—</b><small>Beginnende heerser</small></div></div>
+<div class="village-scene" id="village"><div class="scene-sky"><span class="cloud cloud1"></span><span class="cloud cloud2"></span><span class="sun"></span></div><div class="scene-hill hillback"></div><div class="scene-hill hillfront"></div><div class="scene-river"></div><div class="scene-road"></div><div class="castle"><div class="tower t1"></div><div class="tower t2"></div><div class="keep"><div class="flag">⚑</div><div class="gate"></div></div><div class="wall"></div></div><div class="village-label"><b><?=h($v['name'])?></b><span><?= (int)$v['x'] ?>|<?= (int)$v['y'] ?></span></div><div class="scene-caption">JOUW DORP <span>◆</span> NOORDRIJK</div></div>
+<div class="section-title" id="buildings"><div><p class="eyebrow">ONTWIKKEL JE NEDERZETTING</p><h2>Gebouwen</h2></div><span class="subtle">Selecteer een gebouw om te upgraden</span></div>
+<div class="building-grid"><?php foreach($catalog as $key=>$b): $level=$levels[$key]??0; $cost=building_cost($key,$level+1); $busy=false; foreach($queue as $item) if($item['building_key']===$key)$busy=true; ?><article class="building-card"><div class="building-art art-<?=h($key)?>"><span><?=$b['icon']?></span><i>Lv. <?=$level?></i></div><div class="building-info"><h3><?=h($b['name'])?></h3><p><?=h($b['desc'])?></p><div class="costs"><span>🪵 <?=$cost['wood']?></span><span>🧱 <?=$cost['clay']?></span><span>⛓ <?=$cost['iron']?></span></div><button class="upgrade" data-building="<?=h($key)?>" <?=($busy||count($queue)>=2)?'disabled':''?>><?=$busy?'In aanbouw':($level===0?'Bouwen':'Verbeteren')?> →</button></div></article><?php endforeach; ?></div>
+<div class="section-title" id="queue"><div><p class="eyebrow">WERK IN UITVOERING</p><h2>Bouwrij</h2></div><span class="subtle">Max. 2 opdrachten</span></div><div class="queue-list"><?php if(!$queue): ?><div class="empty">⚒ <b>Geen bouwopdrachten</b><span>Kies een gebouw hierboven om je dorp te ontwikkelen.</span></div><?php else: foreach($queue as $item): $b=$catalog[$item['building_key']]??array('name'=>$item['building_key'],'icon'=>'⚒'); ?><div class="queue-item"><span class="queue-icon"><?=$b['icon']?></span><div class="queue-detail"><b><?=h($b['name'])?> niveau <?= (int)$item['target_level'] ?></b><small>Voltooid om <?=date('H:i:s',(int)$item['completes_at'])?></small><div class="progress"><i style="width:<?=max(0,min(100,(int)(100*(time()-(int)$item['started_at'])/max(1,(int)$item['completes_at']-(int)$item['started_at']))))?>%"></i></div></div><span class="timer" data-completes="<?=(int)$item['completes_at']?>">…</span><button class="cancel" data-id="<?=(int)$item['id']?>">Annuleren</button></div><?php endforeach; endif; ?></div>
+<div class="section-title" id="map"><div><p class="eyebrow">DE WERELD LIGT OPEN</p><h2>Wereldkaart</h2></div><span class="subtle">Coördinaten <?= (int)$v['x'] ?>|<?= (int)$v['y'] ?></span></div><div class="map-panel"><div class="map-grid"><?php for($i=0;$i<81;$i++): $center=$i===40; ?><div class="map-tile <?=$center?'own':''?>"><?=$center?'♜':(in_array($i,array(6,16,24,56,65,74),true)?'🌲':(in_array($i,array(11,35,49,70),true)?'⛰':'·'))?></div><?php endfor; ?></div><div class="map-note"><b>De omgeving van <?=h($v['name'])?></b><p>Dit is een lokale kaartweergave. Multiplayer-dorpen en verovering worden in volgende ontwikkelfasen toegevoegd.</p></div></div>
+<div class="section-title" id="army"><div><p class="eyebrow">VERDEDIG JE DORP</p><h2>Leger & training</h2></div><span class="subtle">Beschikbare eenheden en trainingsrij</span></div>
+<div class="feature-panel"><div class="troop-roster"><?php foreach($troopNames as $unit=>$unitName): ?><div class="troop-card"><span class="troop-symbol"><?=array('spear'=>'🗡️','sword'=>'⚔️','axe'=>'🪓','scout'=>'🐎')[$unit]?></span><b><?=h($unitName)?></b><strong><?=number_format($troops[$unit]??0)?></strong></div><?php endforeach; ?></div>
+<div class="feature-form"><label>Eenheid<select id="recruit-unit"><option value="spear">Speervechter</option><option value="sword">Zwaardvechter</option><option value="axe">Bijlvechter</option><option value="scout">Verkenner</option></select></label><label>Aantal<input id="recruit-amount" type="number" min="1" max="100" value="5"></label><button id="recruit-button" class="upgrade">Train troepen</button></div>
+<?php if($troopQueue): ?><div class="queue-list"><?php foreach($troopQueue as $tq): ?><div class="queue-item"><span class="queue-icon">🛡️</span><div class="queue-detail"><b><?= (int)$tq['amount'] ?> × <?=h($troopNames[$tq['unit_key']]??$tq['unit_key'])?></b><small>Training voltooid om <?=date('H:i:s',(int)$tq['completes_at'])?></small></div><span class="timer" data-completes="<?=(int)$tq['completes_at']?>">…</span></div><?php endforeach; ?></div><?php else: ?><p class="subtle">Geen troepen in training.</p><?php endif; ?></div>
+<div class="section-title" id="scouting"><div><p class="eyebrow">VERKEN DE OMGEVING</p><h2>Verkenningsmissie</h2></div></div><div class="feature-panel"><p class="subtle">Stuur verkenners naar coördinaten. Dit prototype gebruikt een tijdelijke kaart; echte dorpsgevechten en veroveringen zijn nog niet aangesloten.</p><div class="feature-form"><label>X-coördinaat<input id="target-x" type="number" min="0" max="999" value="<?=min(999,(int)$v['x']+3)?>"></label><label>Y-coördinaat<input id="target-y" type="number" min="0" max="999" value="<?=(int)$v['y']?>"></label><label>Aantal verkenners<input id="scout-amount" type="number" min="1" max="10000" value="1"></label><button id="scout-button" class="upgrade">Verken locatie</button></div></div>
+<div class="section-title" id="tribe"><div><p class="eyebrow">SLUIT JE AAN BIJ ANDEREN</p><h2>Stam & diplomatie</h2></div></div><div class="feature-panel"><?php if($tribe): ?><h3><?=h($tribe['name'])?> [<?=h($tribe['tag'])?>]</h3><p><?=h($tribe['description'])?></p><small>Jouw rol: <?=h($tribe['role'])?></small><?php else: ?><p>Je bent nog geen stam gestart of lid van een stam.</p><div class="feature-form"><label>Stamnaam<input id="tribe-name" maxlength="40" placeholder="Naam van je stam"></label><label>Tag (2–8 tekens)<input id="tribe-tag" maxlength="8" placeholder="TAG"></label><button id="tribe-button" class="upgrade">Richt stam op</button></div><?php endif; ?></div>
+<div class="section-title" id="messages"><div><p class="eyebrow">COMMUNICEER MET SPELERS</p><h2>Berichten</h2></div></div><div class="feature-panel"><div class="feature-form"><label>Ontvanger (gebruikersnaam)<input id="message-to" placeholder="Speler"></label><label>Onderwerp<input id="message-subject" maxlength="150" placeholder="Onderwerp"></label><label>Bericht<textarea id="message-body" maxlength="4000" rows="3" placeholder="Schrijf je bericht…"></textarea></label><button id="message-button" class="upgrade">Verstuur bericht</button></div><?php if($messages): ?><div class="report-list"><h3>Inbox</h3><?php foreach($messages as $m): ?><article><b><?=h($m['subject'])?></b><small>Van <?=h($m['sender_name'])?> · <?=h($m['created_at'])?></small><p><?=nl2br(h($m['body']))?></p></article><?php endforeach; ?></div><?php else: ?><p class="subtle">Je inbox is leeg.</p><?php endif; ?></div>
+<div class="section-title" id="reports"><div><p class="eyebrow">GEBEURTENISSEN IN JE RIJK</p><h2>Rapporten</h2></div></div><div class="feature-panel report-list"><?php if(!$reports): ?><p class="subtle">Nog geen rapporten ontvangen.</p><?php else: foreach($reports as $report): ?><article><b><?=h($report['title'])?></b><small><?=h($report['created_at'])?></small><p><?=nl2br(h($report['body']))?></p></article><?php endforeach; endif; ?></div>
+<footer>TRIBAL WARS REMASTER · FANPROJECT · <?=date('Y')?> <span>Strategie · Economie · Oorlog</span></footer></section></main>
+<div class="toast" id="toast" role="status"></div><script>const csrfToken=<?=json_encode(csrf())?>;const toast=document.getElementById('toast');function notify(t){toast.textContent=t;toast.classList.add('show');setTimeout(()=>toast.classList.remove('show'),3500)}async function action(data){try{const r=await fetch('?api=1',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({...data,csrf:csrfToken})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Actie mislukt');notify(j.message||'Gelukt');if(j.refresh)setTimeout(()=>location.reload(),650)}catch(e){notify(e.message)}}document.querySelectorAll('.upgrade[data-building]').forEach(b=>b.addEventListener('click',()=>action({action:'upgrade',building:b.dataset.building})));
+const byId=id=>document.getElementById(id);const bind=(id,fn)=>{const el=byId(id);if(el)el.addEventListener('click',fn)};
+bind('recruit-button',()=>action({action:'recruit',unit:byId('recruit-unit').value,amount:Number(byId('recruit-amount').value)}));
+bind('scout-button',()=>action({action:'send_troops',unit:'scout',amount:Number(byId('scout-amount').value),x:Number(byId('target-x').value),y:Number(byId('target-y').value)}));
+bind('tribe-button',()=>action({action:'create_tribe',name:byId('tribe-name').value,tag:byId('tribe-tag').value}));
+bind('message-button',()=>action({action:'send_message',to:byId('message-to').value,subject:byId('message-subject').value,body:byId('message-body').value}));document.querySelectorAll('.cancel').forEach(b=>b.addEventListener('click',()=>{if(confirm('Bouwopdracht annuleren? Je krijgt 50% van de kosten terug.'))action({action:'cancel',id:b.dataset.id})}));function timers(){document.querySelectorAll('[data-completes]').forEach(e=>{let n=Number(e.dataset.completes)-Math.floor(Date.now()/1000);e.textContent=n<=0?'klaar':Math.floor(n/60)+'m '+(n%60)+'s'})}timers();setInterval(timers,1000);setInterval(()=>location.reload(),30000);</script></body></html>

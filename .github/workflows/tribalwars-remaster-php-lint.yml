@@ -1,0 +1,23 @@
+name: Tribal Wars Remaster PHP lint
+on:
+  pull_request:
+    paths:
+      - 'tribalwars-remaster/**'
+  push:
+    branches:
+      - tribalwars-remaster-foundation
+    paths:
+      - 'tribalwars-remaster/**'
+jobs:
+  php-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up PHP 7.4
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '7.4'
+      - name: Lint PHP files
+        run: |
+          php -l tribalwars-remaster/index.php
+          php -l tribalwars-remaster/install.php
