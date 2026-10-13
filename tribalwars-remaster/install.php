@@ -34,6 +34,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 "CREATE TABLE IF NOT EXISTS tribe_members (tribe_id INT UNSIGNED NOT NULL, user_id INT UNSIGNED NOT NULL, role VARCHAR(20) NOT NULL DEFAULT 'member', joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(tribe_id,user_id), UNIQUE KEY one_tribe_per_user(user_id), CONSTRAINT fk_member_tribe FOREIGN KEY(tribe_id) REFERENCES tribes(id) ON DELETE CASCADE, CONSTRAINT fk_member_user FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE) ENGINE=InnoDB"
             );
             foreach ($sql as $statement) { $pdo->exec($statement); }
+            $columns = $pdo->query("SHOW COLUMNS FROM villages LIKE 'last_tick'")->fetchAll();
+            if (!$columns) { $pdo->exec("ALTER TABLE villages ADD COLUMN last_tick INT NOT NULL DEFAULT 0"); }
+            $unique = $pdo->query("SHOW INDEX FROM villages WHERE Key_name = 'one_home_per_user'")->fetchAll();
+            if ($unique) { $pdo->exec("ALTER TABLE villages DROP INDEX one_home_per_user"); }
+
             $config = "<?php\nreturn ".var_export(array('host'=>$host,'port'=>$port,'database'=>$database,'username'=>$username,'password'=>$password), true).";\n";
             $target = __DIR__.'/config.local.php';
             if (file_put_contents($target, $config, LOCK_EX) === false) {
