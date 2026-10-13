@@ -83,6 +83,58 @@ if (isset($_GET['api'])) {
         $del=$pdo->prepare('DELETE FROM build_queue WHERE id=?'); $del->execute(array($id)); $pdo->commit();
         json_out(array('ok'=>true,'message'=>'Bouw geannuleerd; 50% van de kosten terugbetaald.','refresh'=>true));
     }
+    if ($action==='recruit') {
+        $unit=(string)($input['unit']??'spear'); $amount=(int)($input['amount']??0);
+        $units=array('spear'=>array('name'=>'Speervechter','wood'=>50,'clay'=>30,'iron'=>10,'crop'=>15,'seconds'=>20),'sword'=>array('name'=>'Zwaardvechter','wood'=>30,'clay'=>30,'iron'=>70,'crop'=>15,'seconds'=>28),'axe'=>array('name'=>'Bijlvechter','wood'=>60,'clay'=>30,'iron'=>40,'crop'=>20,'seconds'=>25),'scout'=>array('name'=>'Verkenner','wood'=>50,'clay'=>50,'iron'=>20,'crop'=>10,'seconds'=>18));
+        if(!isset($units[$unit])||$amount<1||$amount>100) json_out(array('ok'=>false,'error'=>'Kies een geldige eenheid en 1–100 troepen.'),400);
+        $u=$units[$unit]; $cost=array('wood'=>$u['wood']*$amount,'clay'=>$u['clay']*$amount,'iron'=>$u['iron']*$amount,'crop'=>$u['crop']*$amount);
+        foreach($cost as $r=>$n) if((int)$v[$r]<$n) json_out(array('ok'=>false,'error'=>'Niet genoeg grondstoffen om deze troepen te trainen.'),400);
+        $b=$pdo->prepare('SELECT level FROM buildings WHERE village_id=? AND building_key=?'); $b->execute(array($v['id'],'barracks'));
+        if((int)$b->fetchColumn()<1) json_out(array('ok'=>false,'error'=>'Bouw eerst de kazerne.'),400);
+        $pdo->beginTransaction();
+        try {
+            $up=$pdo->prepare('UPDATE villages SET wood=wood-?,clay=clay-?,iron=iron-?,crop=crop-? WHERE id=? AND wood>=? AND clay>=? AND iron>=? AND crop>=?');
+            $up->execute(array($cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],$v['id'],$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop']));
+            if($up->rowCount()!==1) throw new RuntimeException('Grondstoffen gewijzigd; probeer opnieuw.');
+            $ins=$pdo->prepare('INSERT INTO troop_queue(village_id,unit_key,amount,wood_cost,clay_cost,iron_cost,crop_cost,completes_at) VALUES(?,?,?,?,?,?,?,?)');
+            $ins->execute(array($v['id'],$unit,$amount,$cost['wood'],$cost['clay'],$cost['iron'],$cost['crop'],time()+max(20,$u['seconds']*$amount)));
+            $pdo->commit();
+        } catch(Throwable $e) { $pdo->rollBack(); json_out(array('ok'=>false,'error'=>$e->getMessage()),400); }
+        json_out(array('ok'=>true,'message'=>$amount.' '.$u['name'].' in de trainingsrij gezet.','refresh'=>true));
+    }
+    if ($action==='send_troops') {
+        $x=filter_var($input['x']??null,FILTER_VALIDATE_INT); $y=filter_var($input['y']??null,FILTER_VALIDATE_INT);
+        $unit=(string)($input['unit']??'spear'); $amount=(int)($input['amount']??0);
+        if($x===false||$y===false||$x<0||$x>999||$y<0||$y>999||$amount<1||$amount>10000||!in_array($unit,array('spear','sword','axe','scout'),true)) json_out(array('ok'=>false,'error'=>'Controleer coördinaten, eenheid en aantal.'),400);
+        $s=$pdo->prepare('SELECT amount FROM village_troops WHERE village_id=? AND unit_key=?'); $s->execute(array($v['id'],$unit)); $owned=(int)$s->fetchColumn();
+        if($owned<$amount) json_out(array('ok'=>false,'error'=>'Je hebt niet genoeg beschikbare troepen van dit type.'),400);
+        $distance=sqrt(pow($x-(int)$v['x'],2)+pow($y-(int)$v['y'],2)); $seconds=max(30,(int)ceil($distance*60));
+        $pdo->beginTransaction();
+        $upd=$pdo->prepare('UPDATE village_troops SET amount=amount-? WHERE village_id=? AND unit_key=? AND amount>=?'); $upd->execute(array($amount,$v['id'],$unit,$amount));
+        if($upd->rowCount()!==1){$pdo->rollBack();json_out(array('ok'=>false,'error'=>'Troepenvoorraad is gewijzigd.'),400);}
+        $mv=$pdo->prepare('INSERT INTO movements(source_village_id,target_x,target_y,units_json,movement_type,status,started_at,arrives_at) VALUES(?,?,?,?,?,?,?,?)');
+        $mv->execute(array($v['id'],$x,$y,json_encode(array($unit=>$amount)),'scout','traveling',time(),time()+$seconds));
+        $pdo->commit();
+        json_out(array('ok'=>true,'message'=>'Verkenningsmars gestart. Aankomst over ongeveer '.$seconds.' seconden.','refresh'=>true));
+    }
+    if ($action==='create_tribe') {
+        $name=trim((string)($input['name']??'')); $tag=strtoupper(trim((string)($input['tag']??'')));
+        if(mb_strlen($name)<3||mb_strlen($name)>40||!preg_match('/^[A-Z0-9]{2,8}$/',$tag)) json_out(array('ok'=>false,'error'=>'Stamnaam: 3–40 tekens; tag: 2–8 letters/cijfers.'),400);
+        $check=$pdo->prepare('SELECT tribe_id FROM tribe_members WHERE user_id=?'); $check->execute(array($user['id']));
+        if($check->fetchColumn()) json_out(array('ok'=>false,'error'=>'Je zit al in een stam.'),400);
+        try { $pdo->beginTransaction(); $ins=$pdo->prepare('INSERT INTO tribes(name,tag,founder_id,description) VALUES(?,?,?,?)'); $ins->execute(array($name,$tag,$user['id'],'Een nieuwe stam.')); $tid=(int)$pdo->lastInsertId(); $mem=$pdo->prepare('INSERT INTO tribe_members(tribe_id,user_id,role) VALUES(?,?,?)'); $mem->execute(array($tid,$user['id'],'founder')); $pdo->commit(); }
+        catch(Throwable $e){if($pdo->inTransaction())$pdo->rollBack();json_out(array('ok'=>false,'error'=>'Deze stamnaam of tag is al bezet.'),400);}
+        json_out(array('ok'=>true,'message'=>'Stam '.$tag.' is opgericht.','refresh'=>true));
+    }
+    if ($action==='send_message') {
+        $to=trim((string)($input['to']??'')); $subject=trim((string)($input['subject']??'')); $body=trim((string)($input['body']??''));
+        if($to===''||$subject===''||$body===''||mb_strlen($subject)>150||mb_strlen($body)>4000) json_out(array('ok'=>false,'error'=>'Vul ontvanger, onderwerp en bericht in (max. 4000 tekens).'),400);
+        $find=$pdo->prepare('SELECT id FROM users WHERE username=?'); $find->execute(array($to)); $recipient=(int)$find->fetchColumn();
+        if(!$recipient) json_out(array('ok'=>false,'error'=>'Ontvanger niet gevonden.'),404);
+        $ins=$pdo->prepare('INSERT INTO game_messages(sender_id,recipient_id,subject,body) VALUES(?,?,?,?)'); $ins->execute(array($user['id'],$recipient,$subject,$body));
+        $rep=$pdo->prepare('INSERT INTO game_reports(user_id,title,body) VALUES(?,?,?)'); $rep->execute(array($user['id'],'Bericht verzonden: '.$subject,'Je bericht aan '.$to.' is verzonden.'));
+        json_out(array('ok'=>true,'message'=>'Bericht verzonden.','refresh'=>true));
+    }
     json_out(array('ok'=>false,'error'=>'Onbekende actie.'),400);
 }
 $error=''; $message='';
